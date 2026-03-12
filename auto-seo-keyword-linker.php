@@ -1,8 +1,8 @@
 <?php
 /**
  * Plugin Name: Auto SEO Keyword Linker
- * Description: Keyword-to-link transformer with CSV import/export, suggestion scanning, Unicode-aware matching, and sitewide blacklisting.
- * Version: 1.5.0
+ * Description: Keyword-to-link transformer with CSV import/export, suggestion scanning, Unicode-aware matching, sitewide blacklisting, and content targeting controls.
+ * Version: 1.6.0
  * License: GPL-2.0-or-later
  * Text Domain: auto-seo-keyword-linker
  */
@@ -38,6 +38,7 @@ add_action( 'admin_init', function() {
 	add_settings_field( 'max', 'Max Links Per Page', 'akl_f_max', AKL_PAGE_SLUG, 'main' );
 	add_settings_field( 'ext', 'External Link Behaviour', 'akl_f_ext', AKL_PAGE_SLUG, 'main' );
 	add_settings_field( 'blacklist', 'Sitewide Blacklist', 'akl_f_blacklist', AKL_PAGE_SLUG, 'main' );
+	add_settings_field( 'targets', 'Content Types', 'akl_f_targets', AKL_PAGE_SLUG, 'main' );
 	add_settings_field( 'scanner_words', 'Scanner Phrase Length', 'akl_f_scanner_words', AKL_PAGE_SLUG, 'main' );
 	add_settings_field( 'scanner_min_hits', 'Scanner Minimum Occurrences', 'akl_f_scanner_min_hits', AKL_PAGE_SLUG, 'main' );
 	add_settings_field( 'scanner_excluded', 'Scanner Excluded Phrases', 'akl_f_scanner_excluded', AKL_PAGE_SLUG, 'main' );
@@ -53,6 +54,8 @@ function akl_get_settings() {
 		'max'              => 1,
 		'tab'              => 0,
 		'nf'               => 0,
+		'target_posts'     => 1,
+		'target_pages'     => 1,
 		'scanner_words'    => 3,
 		'scanner_min_hits' => 2,
 		'scanner_excluded' => '',
@@ -68,7 +71,7 @@ function akl_get_settings() {
 }
 
 /*
- * Quote normalisation for internal matching.
+ * Normalise quote variants for internal matching.
  */
 function akl_normalize_quotes( $text ) {
 	return str_replace(
@@ -79,7 +82,7 @@ function akl_normalize_quotes( $text ) {
 }
 
 /*
- * Create a stable internal keyword form for deduplication and matching.
+ * Build a stable internal form for keyword comparison.
  */
 function akl_normalize_keyword_for_matching( $keyword ) {
 	$keyword = html_entity_decode( (string) $keyword, ENT_QUOTES | ENT_HTML5, 'UTF-8' );
@@ -88,6 +91,37 @@ function akl_normalize_keyword_for_matching( $keyword ) {
 	$keyword = preg_replace( '/\s+/u', ' ', trim( $keyword ) );
 
 	return $keyword;
+}
+
+/*
+ * Lightweight stop-word list for scanner quality control.
+ */
+function akl_get_stop_words() {
+	return [
+		'a', 'an', 'and', 'are', 'as', 'at', 'be', 'but', 'by',
+		'for', 'from', 'has', 'have', 'in', 'is', 'it', 'its',
+		'of', 'on', 'or', 'that', 'the', 'their', 'this', 'to',
+		'was', 'were', 'will', 'with'
+	];
+}
+
+function akl_phrase_has_too_many_stop_words( $phrase ) {
+	$words = preg_split( '/\s+/u', mb_strtolower( $phrase, 'UTF-8' ), -1, PREG_SPLIT_NO_EMPTY );
+
+	if ( empty( $words ) ) {
+		return true;
+	}
+
+	$stop_words = akl_get_stop_words();
+	$stop_count = 0;
+
+	foreach ( $words as $word ) {
+		if ( in_array( $word, $stop_words, true ) ) {
+			$stop_count++;
+		}
+	}
+
+	return $stop_count >= count( $words );
 }
 
 function akl_f_pairs() {
@@ -136,6 +170,22 @@ function akl_f_blacklist() {
 	);
 }
 
+function akl_f_targets() {
+	$o = akl_get_settings();
+
+	printf(
+		'<label><input type="checkbox" name="%1$s[target_posts]" value="1" %2$s /> Posts</label><br>',
+		esc_attr( AKL_OPT ),
+		checked( ! empty( $o['target_posts'] ), true, false )
+	);
+
+	printf(
+		'<label><input type="checkbox" name="%1$s[target_pages]" value="1" %2$s /> Pages</label><p class="description">Choose where automatic linking is applied.</p>',
+		esc_attr( AKL_OPT ),
+		checked( ! empty( $o['target_pages'] ), true, false )
+	);
+}
+
 function akl_f_scanner_words() {
 	$o = akl_get_settings();
 
@@ -160,14 +210,14 @@ function akl_f_scanner_excluded() {
 	$o = akl_get_settings();
 
 	printf(
-		'<textarea name="%1$s[scanner_excluded]" rows="5" class="large-text code" placeholder="example phrase">%2$s</textarea><p class="description">One phrase per line. Excluded phrases will not be shown in scan results.</p>',
+		'<textarea name="%1$s[scanner_excluded]" rows="5" class="large-text code" placeholder="example phrase">%2$s</textarea><p class="description">One phrase per line. Excluded phrases will not appear in scanner results.</p>',
 		esc_attr( AKL_OPT ),
 		esc_textarea( $o['scanner_excluded'] )
 	);
 }
 
 /*
- * Build a cleaned, deduplicated rule list from raw textarea input.
+ * Build a cleaned and deduplicated rule list.
  */
 function akl_clean_pairs_for_storage( $pairs_raw ) {
 	$lines     = preg_split( '/\r\n|\r|\n/', (string) $pairs_raw );
@@ -203,6 +253,31 @@ function akl_clean_pairs_for_storage( $pairs_raw ) {
 	return implode( "\n", $cleaned );
 }
 
+function akl_sanitize_phrase_list( $raw ) {
+	$lines     = preg_split( '/\r\n|\r|\n/', (string) $raw );
+	$cleaned   = [];
+	$seen_keys = [];
+
+	foreach ( $lines as $line ) {
+		$line = akl_normalize_keyword_for_matching( $line );
+
+		if ( '' === $line ) {
+			continue;
+		}
+
+		$key = mb_strtolower( $line, 'UTF-8' );
+
+		if ( isset( $seen_keys[ $key ] ) ) {
+			continue;
+		}
+
+		$seen_keys[ $key ] = true;
+		$cleaned[]         = $line;
+	}
+
+	return implode( "\n", $cleaned );
+}
+
 /*
  * Sanitise settings before saving.
  */
@@ -211,7 +286,7 @@ function akl_sanitize( $input ) {
 
 	$pairs            = isset( $input['pairs'] ) ? akl_clean_pairs_for_storage( wp_unslash( $input['pairs'] ) ) : '';
 	$bl               = isset( $input['bl'] ) ? sanitize_textarea_field( wp_unslash( $input['bl'] ) ) : '';
-	$scanner_excluded = isset( $input['scanner_excluded'] ) ? sanitize_textarea_field( wp_unslash( $input['scanner_excluded'] ) ) : '';
+	$scanner_excluded = isset( $input['scanner_excluded'] ) ? akl_sanitize_phrase_list( wp_unslash( $input['scanner_excluded'] ) ) : '';
 	$max              = isset( $input['max'] ) ? absint( $input['max'] ) : 1;
 	$scanner_words    = isset( $input['scanner_words'] ) ? absint( $input['scanner_words'] ) : 3;
 	$scanner_min_hits = isset( $input['scanner_min_hits'] ) ? absint( $input['scanner_min_hits'] ) : 2;
@@ -222,6 +297,8 @@ function akl_sanitize( $input ) {
 		'max'              => max( 1, min( 50, $max ) ),
 		'tab'              => ! empty( $input['tab'] ) ? 1 : 0,
 		'nf'               => ! empty( $input['nf'] ) ? 1 : 0,
+		'target_posts'     => ! empty( $input['target_posts'] ) ? 1 : 0,
+		'target_pages'     => ! empty( $input['target_pages'] ) ? 1 : 0,
 		'scanner_words'    => max( 2, min( 6, $scanner_words ) ),
 		'scanner_min_hits' => max( 1, min( 20, $scanner_min_hits ) ),
 		'scanner_excluded' => $scanner_excluded,
@@ -285,7 +362,6 @@ add_action( 'admin_init', function() {
 		}
 
 		$new_rows = [];
-
 		fgetcsv( $handle );
 
 		while ( false !== ( $data = fgetcsv( $handle ) ) ) {
@@ -358,7 +434,7 @@ function akl_page() {
 	);
 	?>
 	<div class="wrap">
-		<h1>Auto SEO Keyword Linker <small>v1.5.0</small></h1>
+		<h1>Auto SEO Keyword Linker <small>v1.6.0</small></h1>
 
 		<div style="display:grid;grid-template-columns:2fr 1fr;gap:20px;align-items:start;">
 			<div>
@@ -386,7 +462,7 @@ function akl_page() {
 			<div>
 				<div class="card" style="padding:16px;">
 					<h3 style="margin-top:0;">Suggestion Scanner</h3>
-					<p>Scan recent published posts for repeated phrase candidates.</p>
+					<p>Scan recent published content for repeated phrase candidates.</p>
 					<button type="button" class="button" id="akl-scan">Find Suggestions</button>
 					<div id="akl-res" style="margin-top:10px;"></div>
 				</div>
@@ -396,6 +472,27 @@ function akl_page() {
 
 	<script>
 	jQuery(function($){
+		function renderSuggestions(items) {
+			if (!items || !items.length) {
+				$('#akl-res').text('No suggestions found.');
+				return;
+			}
+
+			let html = '<table class="widefat striped"><thead><tr><th>Phrase</th><th>Occurrences</th><th>Target</th><th>Action</th></tr></thead><tbody>';
+
+			items.forEach(function(item) {
+				html += '<tr>';
+				html += '<td>' + $('<div>').text(item.k).html() + '</td>';
+				html += '<td>' + $('<div>').text(item.hits).html() + '</td>';
+				html += '<td><small>' + $('<div>').text(item.u).html() + '</small></td>';
+				html += '<td><button type="button" class="button-link-delete akl-exclude" data-phrase="' + $('<div>').text(item.k).html() + '">Exclude</button></td>';
+				html += '</tr>';
+			});
+
+			html += '</tbody></table>';
+			$('#akl-res').html(html);
+		}
+
 		$('#akl-scan').on('click', function(){
 			const $button = $(this);
 			const $result = $('#akl-res');
@@ -408,19 +505,8 @@ function akl_page() {
 				nonce: '<?php echo esc_js( wp_create_nonce( 'akl_scan' ) ); ?>'
 			})
 			.done(function(response){
-				if (response.success && response.data && response.data.length) {
-					let html = '<table class="widefat striped"><thead><tr><th>Phrase</th><th>Occurrences</th><th>Target</th></tr></thead><tbody>';
-
-					response.data.forEach(function(item) {
-						html += '<tr>';
-						html += '<td>' + $('<div>').text(item.k).html() + '</td>';
-						html += '<td>' + $('<div>').text(item.hits).html() + '</td>';
-						html += '<td><small>' + $('<div>').text(item.u).html() + '</small></td>';
-						html += '</tr>';
-					});
-
-					html += '</tbody></table>';
-					$result.html(html);
+				if (response.success && response.data) {
+					renderSuggestions(response.data);
 				} else {
 					$result.text('No suggestions found.');
 				}
@@ -430,6 +516,35 @@ function akl_page() {
 			})
 			.always(function(){
 				$button.prop('disabled', false).text('Find Suggestions');
+			});
+		});
+
+		$(document).on('click', '.akl-exclude', function(){
+			const $button = $(this);
+			const phrase = $button.data('phrase');
+
+			$button.prop('disabled', true).text('Excluding...');
+
+			$.post(ajaxurl, {
+				action: 'akl_exclude_phrase',
+				nonce: '<?php echo esc_js( wp_create_nonce( 'akl_exclude_phrase' ) ); ?>',
+				phrase: phrase
+			})
+			.done(function(response){
+				if (response.success) {
+					$button.closest('tr').fadeOut(150, function(){
+						$(this).remove();
+
+						if ($('#akl-res tbody tr').length === 0) {
+							$('#akl-res').text('No suggestions found.');
+						}
+					});
+				} else {
+					$button.prop('disabled', false).text('Exclude');
+				}
+			})
+			.fail(function(){
+				$button.prop('disabled', false).text('Exclude');
 			});
 		});
 	});
@@ -500,9 +615,6 @@ function akl_is_blacklisted( $blacklist_raw ) {
 	return false;
 }
 
-/*
- * Compare URLs in a normalised form to avoid self-links.
- */
 function akl_normalize_url_for_compare( $url ) {
 	$url = esc_url_raw( (string) $url );
 
@@ -516,13 +628,63 @@ function akl_normalize_url_for_compare( $url ) {
 		return '';
 	}
 
-	$scheme = isset( $parts['scheme'] ) ? strtolower( $parts['scheme'] ) : '';
+	$scheme = isset( $parts['scheme'] ) ? strtolower( $parts['scheme'] ) : 'http';
 	$host   = strtolower( $parts['host'] );
 	$path   = isset( $parts['path'] ) ? untrailingslashit( $parts['path'] ) : '';
 	$query  = isset( $parts['query'] ) ? '?' . $parts['query'] : '';
 
 	return $scheme . '://' . $host . $path . $query;
 }
+
+function akl_get_current_url() {
+	$request_uri = isset( $_SERVER['REQUEST_URI'] ) ? wp_unslash( $_SERVER['REQUEST_URI'] ) : '';
+
+	return home_url( $request_uri );
+}
+
+function akl_should_run_on_current_post_type( $settings ) {
+	if ( is_singular( 'post' ) && ! empty( $settings['target_posts'] ) ) {
+		return true;
+	}
+
+	if ( is_singular( 'page' ) && ! empty( $settings['target_pages'] ) ) {
+		return true;
+	}
+
+	return false;
+}
+
+add_action( 'wp_ajax_akl_exclude_phrase', function() {
+	check_ajax_referer( 'akl_exclude_phrase', 'nonce' );
+
+	if ( ! current_user_can( 'manage_options' ) ) {
+		wp_send_json_error( [ 'message' => 'Permission denied.' ], 403 );
+	}
+
+	$phrase = isset( $_POST['phrase'] ) ? akl_normalize_keyword_for_matching( wp_unslash( $_POST['phrase'] ) ) : '';
+
+	if ( '' === $phrase ) {
+		wp_send_json_error( [ 'message' => 'Missing phrase.' ], 400 );
+	}
+
+	$settings = akl_get_settings();
+	$existing = akl_sanitize_phrase_list(
+		implode(
+			"\n",
+			array_filter(
+				[
+					$settings['scanner_excluded'],
+					$phrase,
+				]
+			)
+		)
+	);
+
+	$settings['scanner_excluded'] = $existing;
+	update_option( AKL_OPT, $settings );
+
+	wp_send_json_success( [ 'phrase' => $phrase ] );
+} );
 
 add_action( 'wp_ajax_akl_scan', function() {
 	check_ajax_referer( 'akl_scan', 'nonce' );
@@ -540,7 +702,8 @@ add_action( 'wp_ajax_akl_scan', function() {
 	$excluded_map     = [];
 	$phrase_hits      = [];
 	$phrase_targets   = [];
-	$phrase_title_hit = [];
+	$phrase_titles    = [];
+	$phrase_display   = [];
 
 	foreach ( $existing_rules as $rule ) {
 		$existing_map[ $rule['k_key'] ] = true;
@@ -560,7 +723,7 @@ add_action( 'wp_ajax_akl_scan', function() {
 		[
 			'numberposts' => 30,
 			'post_status' => 'publish',
-			'post_type'   => 'post',
+			'post_type'   => [ 'post', 'page' ],
 		]
 	);
 
@@ -593,6 +756,10 @@ add_action( 'wp_ajax_akl_scan', function() {
 				continue;
 			}
 
+			if ( akl_phrase_has_too_many_stop_words( $norm ) ) {
+				continue;
+			}
+
 			if ( isset( $existing_map[ $key ] ) || isset( $excluded_map[ $key ] ) ) {
 				continue;
 			}
@@ -604,8 +771,12 @@ add_action( 'wp_ajax_akl_scan', function() {
 			$phrase_hits[ $key ]    = isset( $phrase_hits[ $key ] ) ? $phrase_hits[ $key ] + 1 : 1;
 			$phrase_targets[ $key ] = get_permalink( $post->ID );
 
+			if ( ! isset( $phrase_display[ $key ] ) ) {
+				$phrase_display[ $key ] = $raw;
+			}
+
 			if ( false !== mb_stripos( $title_text, $norm, 0, 'UTF-8' ) ) {
-				$phrase_title_hit[ $key ] = true;
+				$phrase_titles[ $key ] = true;
 			}
 		}
 	}
@@ -617,16 +788,14 @@ add_action( 'wp_ajax_akl_scan', function() {
 			continue;
 		}
 
-		$display_phrase = $key;
+		$score = $hits;
 
-		if ( ! empty( $phrase_title_hit[ $key ] ) ) {
-			$score = $hits + 1;
-		} else {
-			$score = $hits;
+		if ( ! empty( $phrase_titles[ $key ] ) ) {
+			$score += 1;
 		}
 
 		$suggestions[] = [
-			'k'     => $display_phrase,
+			'k'     => $phrase_display[ $key ],
 			'hits'  => $hits,
 			'score' => $score,
 			'u'     => $phrase_targets[ $key ],
@@ -641,9 +810,7 @@ add_action( 'wp_ajax_akl_scan', function() {
 		return $b['score'] <=> $a['score'];
 	} );
 
-	$suggestions = array_slice( $suggestions, 0, 10 );
-
-	wp_send_json_success( $suggestions );
+	wp_send_json_success( array_slice( $suggestions, 0, 10 ) );
 } );
 
 add_filter( 'the_content', function( $content ) {
@@ -662,6 +829,10 @@ add_filter( 'the_content', function( $content ) {
 
 	$settings = akl_get_settings();
 
+	if ( ! akl_should_run_on_current_post_type( $settings ) ) {
+		return $content;
+	}
+
 	if ( empty( $settings['pairs'] ) ) {
 		return $content;
 	}
@@ -676,22 +847,24 @@ add_filter( 'the_content', function( $content ) {
 		return $content;
 	}
 
-	$limit           = max( 1, absint( $settings['max'] ) );
-	$home_host       = wp_parse_url( home_url(), PHP_URL_HOST );
-	$current_url     = akl_normalize_url_for_compare( home_url( add_query_arg( [], $_SERVER['REQUEST_URI'] ?? '' ) ) );
-	$link_counts     = [];
-	$parts           = preg_split( '#(<[^>]+>)#', $content, -1, PREG_SPLIT_DELIM_CAPTURE | PREG_SPLIT_NO_EMPTY );
-	$result          = '';
-	$skip_stack      = [];
+	$limit       = max( 1, absint( $settings['max'] ) );
+	$home_host   = wp_parse_url( home_url(), PHP_URL_HOST );
+	$current_url = akl_normalize_url_for_compare( akl_get_current_url() );
+	$link_counts = [];
+	$parts       = preg_split( '#(<[^>]+>)#', $content, -1, PREG_SPLIT_DELIM_CAPTURE | PREG_SPLIT_NO_EMPTY );
+	$result      = '';
+	$skip_stack  = [];
 
 	foreach ( $parts as $part ) {
 		if ( isset( $part[0] ) && '<' === $part[0] ) {
-			if ( preg_match( '#^<(a|code|pre|script|style|h[1-6])\b#i', $part, $matches ) ) {
+			if ( preg_match( '#^<(a|code|pre|script|style|textarea|button|h[1-6])\b#i', $part, $matches ) ) {
 				$skip_stack[] = strtolower( $matches[1] );
 			}
 
-			if ( preg_match( '#^</(a|code|pre|script|style|h[1-6])>#i', $part ) ) {
-				array_pop( $skip_stack );
+			if ( preg_match( '#^</(a|code|pre|script|style|textarea|button|h[1-6])\s*>#i', $part ) ) {
+				if ( ! empty( $skip_stack ) ) {
+					array_pop( $skip_stack );
+				}
 			}
 
 			$result .= $part;
