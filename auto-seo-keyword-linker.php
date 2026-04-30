@@ -3,6 +3,7 @@
  * Plugin Name: Auto SEO Keyword Linker
  * Description: Keyword-to-link transformer with CSV import/export, suggestion scanning, Unicode-aware matching, sitewide blacklisting, and content targeting controls.
  * Version: 1.6.0
+ * TABARC - Code
  * License: GPL-2.0-or-later
  * Text Domain: auto-seo-keyword-linker
  */
